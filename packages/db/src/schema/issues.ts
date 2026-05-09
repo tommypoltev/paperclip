@@ -33,6 +33,8 @@ export const issues = pgTable(
     priority: text("priority").notNull().default("medium"),
     assigneeAgentId: uuid("assignee_agent_id").references(() => agents.id),
     assigneeUserId: text("assignee_user_id"),
+    reviewerAgentId: uuid("reviewer_agent_id").references(() => agents.id),
+    reviewerUserId: text("reviewer_user_id"),
     checkoutRunId: uuid("checkout_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionRunId: uuid("execution_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     executionAgentNameKey: text("execution_agent_name_key"),
@@ -111,6 +113,14 @@ export const issues = pgTable(
       .on(table.companyId, table.originKind, table.originId)
       .where(
         sql`${table.originKind} = 'stale_active_run_evaluation'
+          and ${table.originId} is not null
+          and ${table.hiddenAt} is null
+          and ${table.status} not in ('done', 'cancelled')`,
+      ),
+    activeProductivityReviewIdx: uniqueIndex("issues_active_productivity_review_uq")
+      .on(table.companyId, table.originKind, table.originId)
+      .where(
+        sql`${table.originKind} = 'issue_productivity_review'
           and ${table.originId} is not null
           and ${table.hiddenAt} is null
           and ${table.status} not in ('done', 'cancelled')`,
