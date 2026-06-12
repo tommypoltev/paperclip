@@ -66,6 +66,7 @@ interface AdapterCapabilities {
   supportsSkills: boolean;
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
+  supportsModelProfiles: boolean;
 }
 
 interface AdapterInfo {
@@ -119,6 +120,7 @@ function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterCapabili
     supportsSkills: Boolean(adapter.listSkills || adapter.syncSkills),
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
+    supportsModelProfiles: Boolean(adapter.modelProfiles?.length || adapter.listModelProfiles),
   };
 }
 
@@ -346,6 +348,21 @@ export function adapterRoutes() {
         res.status(500).json({ error: `Failed to install adapter: ${message}` });
       }
     }
+  });
+
+  router.get("/adapters/:type", async (req, res) => {
+    assertBoardOrgAccess(req);
+
+    const adapterType = req.params.type;
+    const adapter = findServerAdapter(adapterType);
+    if (!adapter) {
+      res.status(404).json({ error: `Adapter "${adapterType}" is not registered.` });
+      return;
+    }
+
+    const externalRecord = getAdapterPluginByType(adapterType);
+    const disabledSet = new Set(getDisabledAdapterTypes());
+    res.json(buildAdapterInfo(adapter, externalRecord, disabledSet));
   });
 
   /**
