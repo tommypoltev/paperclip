@@ -4706,6 +4706,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
           errorFamily: providerQuota ? "provider_quota" : null,
+          retryNotBefore: providerQuotaRetryNotBefore?.toISOString() ?? null,
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {

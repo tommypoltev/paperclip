@@ -5950,6 +5950,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
       expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(
         expectedRetryAt ?? localExpected.toISOString(),
       );
+      expect(result.retryNotBefore).toBe(expectedRetryAt ?? localExpected.toISOString());
     } finally {
       vi.useRealTimers();
     }
@@ -5979,6 +5980,7 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(result.errorCode).toBe("acpx_turn_failed");
     expect(result.errorFamily).toBeNull();
     expect(result.resultJson?.providerQuotaRetryNotBefore).toBeUndefined();
+    expect(result.retryNotBefore).toBeNull();
   });
 
   it("test_flush_child_stderr_runs_on_every_exit_path", async () => {
