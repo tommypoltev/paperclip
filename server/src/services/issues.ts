@@ -6243,13 +6243,20 @@ export function issueService(db: Db) {
           reason: agentWakeupRequests.reason,
           status: agentWakeupRequests.status,
           coalescedCount: agentWakeupRequests.coalescedCount,
-          runId: agentWakeupRequests.runId,
+          runId: heartbeatRuns.id,
           requestedAt: agentWakeupRequests.requestedAt,
           claimedAt: agentWakeupRequests.claimedAt,
           finishedAt: agentWakeupRequests.finishedAt,
           error: agentWakeupRequests.error,
         })
         .from(agentWakeupRequests)
+        .leftJoin(
+          heartbeatRuns,
+          and(
+            eq(heartbeatRuns.id, agentWakeupRequests.runId),
+            eq(heartbeatRuns.companyId, agentWakeupRequests.companyId),
+          ),
+        )
         .where(
           and(
             eq(agentWakeupRequests.companyId, issue.companyId),
@@ -6494,7 +6501,7 @@ export function issueService(db: Db) {
               wake.reason,
               wake.status,
               wake.coalesced_count AS "coalescedCount",
-              wake.run_id AS "runId",
+              run.id AS "runId",
               wake.requested_at AS "requestedAt",
               wake.claimed_at AS "claimedAt",
               wake.finished_at AS "finishedAt",
@@ -6504,6 +6511,9 @@ export function issueService(db: Db) {
                 ORDER BY wake.requested_at DESC, wake.created_at DESC
               )::int AS "rowNumber"
             FROM agent_wakeup_requests wake
+            LEFT JOIN heartbeat_runs run
+              ON run.id = wake.run_id
+             AND run.company_id = wake.company_id
             WHERE wake.company_id = ${issue.companyId}
               AND wake.requested_at >= ${sinceIso}::timestamptz
               AND ${wakeTargetIssueIdSql} IN (${nodeIdValues})

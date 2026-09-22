@@ -15,6 +15,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRelations,
+  issueThreadInteractions,
   issues,
   projects,
 } from "@paperclipai/db";
@@ -26,6 +27,7 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS,
+  INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   MAX_TURN_CONTINUATION_RETRY_REASON,
@@ -212,6 +214,89 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       createdAt: input.now,
     });
   }
+
+  it("retries a skipped addressee wake while the interaction is pending and stops after resolution", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const now = new Date();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "IWR",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Reviewer",
+      role: "reviewer",
+      status: "idle",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Review delivery",
+      status: "in_review",
+      responsibleUserId: "responsible-user",
+      assigneeAgentId: agentId,
+      createdAt: now,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "pending",
+      addresseeAgentId: agentId,
+      payload: { version: 1, prompt: "Approve?" },
+    });
+    await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId,
+      source: "automation",
+      reason: "interaction_pending",
+      status: "skipped",
+      payload: { issueId, interactionId, mutation: "interaction" },
+      requestedAt: new Date(now.getTime() - INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS[0]),
+      finishedAt: new Date(now.getTime() - INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS[0]),
+    });
+
+    const scheduler = heartbeatService(db, { runtimeEnv: {} });
+    expect(
+      await scheduler.retryPendingInteractionAddresseeWakeups(
+        new Date(now.getTime() + INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS[0] + 1_000),
+      ),
+    ).toEqual({ scanned: 1, retried: 1 });
+    const receipts = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.reason, "interaction_pending"));
+    expect(receipts).toHaveLength(2);
+    expect(receipts.some((receipt) => receipt.runId !== null)).toBe(true);
+
+    await db
+      .update(issueThreadInteractions)
+      .set({ status: "accepted", resolvedAt: now })
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(
+      await scheduler.retryPendingInteractionAddresseeWakeups(
+        new Date(now.getTime() + 60 * 60_000),
+      ),
+    ).toEqual({ scanned: 0, retried: 0 });
+    expect(
+      await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.reason, "interaction_pending")),
+    ).toHaveLength(2);
+  });
 
   it("records provider quota failures, schedules the reset-time retry, and leaves the agent idle", async () => {
     const companyId = randomUUID();

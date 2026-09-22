@@ -222,6 +222,13 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     });
     const wakeRunId = randomUUID();
 
+    await db.insert(heartbeatRuns).values({
+      id: wakeRunId,
+      companyId: company.id,
+      agentId: agent.id,
+      status: "succeeded",
+    });
+
     await db.insert(agentWakeupRequests).values({
       companyId: company.id,
       agentId: agent.id,
@@ -462,6 +469,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       assigneeAgentId: agent.id,
     });
     const rawMarker = `RAW-DETAIL-${randomUUID()}`;
+    const missingRunId = randomUUID();
     const [activityRun] = await db.insert(heartbeatRuns).values({
       companyId: company.id,
       agentId: agent.id,
@@ -475,6 +483,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       source: "automation",
       reason: "unknown-private-reason",
       status: "failed",
+      runId: missingRunId,
       payload: { issueId: issue.id, privateValue: rawMarker },
       error: `secret stack ${rawMarker}`,
       requestedAt: new Date(Date.now() - 60_000),
@@ -520,6 +529,7 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       reason: "other",
       status: "failed",
       failureClass: "failed",
+      runId: null,
     });
     const serialized = JSON.stringify(res.body);
     expect(serialized).not.toContain(rawMarker);

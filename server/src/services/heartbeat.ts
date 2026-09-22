@@ -12,6 +12,7 @@ import {
   gt,
   gte,
   inArray,
+  isNotNull,
   isNull,
   lt,
   lte,
@@ -1037,6 +1038,11 @@ const activeRunExecutionPromises = new Set<Promise<void>>();
 // can await a wake that is still before run registration. A caller that tears
 // down a shared database (a test afterEach) then cannot race a late wake.
 const activeWakeupPromises = new Set<Promise<unknown>>();
+export const INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS = [
+  60_000,
+  5 * 60_000,
+  15 * 60_000,
+] as const;
 const nativeSessionResumeDispatchTimers = new Map<
   string,
   ReturnType<typeof setTimeout>
@@ -16983,6 +16989,7 @@ export function heartbeatService(
 
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
+    await retryPendingInteractionAddresseeWakeups();
     const cutoff = await getWorktreeExecutionCutoff();
 
     const queuedRuns = await db
@@ -17001,6 +17008,131 @@ export function heartbeatService(
     for (const agentId of agentIds) {
       await startNextQueuedRunForAgent(agentId);
     }
+  }
+
+  async function retryPendingInteractionAddresseeWakeups(now = new Date()) {
+    const pending = await db
+      .select({ interaction: issueThreadInteractions })
+      .from(issueThreadInteractions)
+      .innerJoin(
+        issues,
+        and(
+          eq(issues.id, issueThreadInteractions.issueId),
+          eq(issues.companyId, issueThreadInteractions.companyId),
+        ),
+      )
+      .innerJoin(
+        companies,
+        and(
+          eq(companies.id, issueThreadInteractions.companyId),
+          eq(companies.status, "active"),
+        ),
+      )
+      .where(
+        and(
+          eq(issueThreadInteractions.status, "pending"),
+          isNotNull(issueThreadInteractions.addresseeAgentId),
+          inArray(issueThreadInteractions.kind, [
+            "request_confirmation",
+            "ask_user_questions",
+            "suggest_tasks",
+          ]),
+        ),
+      )
+      .orderBy(asc(issueThreadInteractions.createdAt))
+      .limit(100);
+
+    let retried = 0;
+    for (const { interaction } of pending) {
+      if (!interaction.addresseeAgentId || interaction.resolvedAt) continue;
+      const receipts = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, interaction.companyId),
+            eq(agentWakeupRequests.agentId, interaction.addresseeAgentId),
+            sql`${agentWakeupRequests.payload}->>'interactionId' = ${interaction.id}`,
+          ),
+        )
+        .orderBy(desc(agentWakeupRequests.requestedAt))
+        .limit(INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS.length + 2);
+      const latest = receipts[0];
+      if (!latest) continue;
+      if (["queued", "claimed", "coalesced", "completed"].includes(latest.status)) continue;
+      if (!["skipped", "failed", "deferred_issue_execution"].includes(latest.status)) continue;
+      const retryAttempt = Math.max(0, receipts.length - 1);
+      const delayMs =
+        INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS[
+          Math.min(retryAttempt, INTERACTION_ADDRESSEE_WAKE_RETRY_DELAYS_MS.length - 1)
+        ]!;
+      if (now.getTime() - latest.updatedAt.getTime() < delayMs) continue;
+      const claimed = await db
+        .update(agentWakeupRequests)
+        .set({ updatedAt: now })
+        .where(
+          and(
+            eq(agentWakeupRequests.id, latest.id),
+            eq(agentWakeupRequests.status, latest.status),
+            sql`date_trunc('milliseconds', ${agentWakeupRequests.updatedAt}) = ${latest.updatedAt.toISOString()}::timestamptz`,
+          ),
+        )
+        .returning({ id: agentWakeupRequests.id });
+      if (claimed.length === 0) continue;
+
+      try {
+        const wakeRun = await enqueueWakeup(interaction.addresseeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "interaction_pending",
+          payload: {
+            issueId: interaction.issueId,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            sourceCommentId: interaction.sourceCommentId ?? null,
+            sourceRunId: interaction.sourceRunId ?? null,
+            mutation: "interaction",
+            interactionWakeRetryAttempt: retryAttempt + 1,
+          },
+          idempotencyKey: `interaction-pending:${interaction.id}:retry:${retryAttempt + 1}`,
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          contextSnapshot: {
+            issueId: interaction.issueId,
+            taskId: interaction.issueId,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            sourceCommentId: interaction.sourceCommentId ?? null,
+            sourceRunId: interaction.sourceRunId ?? null,
+            wakeReason: "interaction_pending",
+            source: "issue.interaction.retry",
+          },
+        });
+        retried += 1;
+        logger.info(
+          {
+            issueId: interaction.issueId,
+            interactionId: interaction.id,
+            agentId: interaction.addresseeAgentId,
+            retryAttempt: retryAttempt + 1,
+            runId: wakeRun?.id ?? null,
+          },
+          "retried pending interaction addressee wake",
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            issueId: interaction.issueId,
+            interactionId: interaction.id,
+            agentId: interaction.addresseeAgentId,
+            retryAttempt: retryAttempt + 1,
+          },
+          "failed to retry pending interaction addressee wake",
+        );
+      }
+    }
+    return { scanned: pending.length, retried };
   }
 
   async function reconcileStrandedAssignedIssues() {
@@ -25697,6 +25829,8 @@ export function heartbeatService(
       cancelInvocationsForAgentsInternal(agentIds, reason),
 
     cancelBudgetScopeWork,
+
+    retryPendingInteractionAddresseeWakeups,
 
     getRunIssueSummary: async (runId: string) => {
       const [run] = await db
