@@ -13,6 +13,10 @@ import type {
   UsageSummary,
 } from "@paperclipai/adapter-utils";
 import {
+  extractClaudeProviderQuotaRetryNotBefore,
+  isClaudeProviderQuotaText,
+} from "@paperclipai/adapter-utils";
+import {
   adapterExecutionTargetSessionIdentity,
   describeAdapterExecutionTarget,
   adapterExecutionTargetDuplexObservabilityRecorder,
@@ -4658,6 +4662,18 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           : channelLost
             ? channelLostMessage
             : resultErrorMessage(terminal);
+        const quotaHaystack = {
+          errorMessage,
+          stdout: outputSegments.join("\n"),
+          stderr: await readChildStderrTail({ logPath: prepared.childStderrLogPath }),
+        };
+        const providerQuota =
+          prepared.acpxAgent === "claude" &&
+          terminal.status === "failed" &&
+          isClaudeProviderQuotaText(quotaHaystack);
+        const providerQuotaRetryNotBefore = providerQuota
+          ? extractClaudeProviderQuotaRetryNotBefore(quotaHaystack)
+          : null;
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
@@ -4675,7 +4691,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           timedOut,
           errorMessage,
           errorCode: terminal.status === "failed"
-            ? "acpx_turn_failed"
+            ? providerQuota
+              ? "provider_quota"
+              : "acpx_turn_failed"
             : timedOut
               ? "acpx_timeout"
               : channelLost
@@ -4687,6 +4705,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...billingFields,
           ...referencedProjectStagingFailuresField,
           model: prepared.requestedModel || null,
+          errorFamily: providerQuota ? "provider_quota" : null,
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {
@@ -4697,6 +4716,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             requestedModel: prepared.requestedModel || null,
             requestedThinkingEffort: prepared.requestedThinkingEffort || null,
             fastMode: prepared.fastMode,
+            ...(providerQuotaRetryNotBefore
+              ? { providerQuotaRetryNotBefore: providerQuotaRetryNotBefore.toISOString() }
+              : {}),
             ...(turnUsage.usageDetail ? { usage: turnUsage.usageDetail } : {}),
             ...(turnUsage.cumulativeCostUsd != null
               ? { cumulativeCostUsd: turnUsage.cumulativeCostUsd }

@@ -5654,6 +5654,16 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     };
   }
 
+  function failedTurn(errorMessage: string) {
+    return {
+      events: (async function* () {
+        yield { type: "done", stopReason: "end_turn" };
+      })(),
+      result: Promise.resolve({ status: "failed", error: new Error(errorMessage) }),
+      cancel: async () => {},
+    };
+  }
+
   function remoteArgs(
     stateDir: string,
     localCwd: string,
@@ -5895,6 +5905,80 @@ describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)"
     expect(result.errorCode).toBe("acpx_turn_failed");
     expect(result.errorMessage).toContain("turn upstream boom");
     expect(result.errorMessage).not.toContain("close boom");
+  });
+
+  it.each([
+    {
+      name: "session limit with an explicit timezone",
+      message: "You've hit your session limit · resets 12:10am (Europe/Madrid)",
+      expectedRetryAt: "2026-09-22T22:10:00.000Z",
+    },
+    {
+      name: "weekly limit in the server timezone",
+      message: "You've hit your weekly limit · resets 9am",
+      expectedRetryAt: null,
+    },
+  ])("classifies Claude ACP $name as provider quota", async ({ message, expectedRetryAt }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-22T08:00:00.000Z"));
+    try {
+      const root = await makeTempRoot();
+      const execute = createAcpxEngineExecutor({
+        createRuntime: () =>
+          ({
+            ensureSession: async () => okHandle,
+            startTurn: () => failedTurn(message),
+            close: async () => {},
+          }) as never,
+      });
+
+      const result = await execute({
+        runId: `provider-quota-${expectedRetryAt ? "session" : "weekly"}`,
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: {},
+        config: { agent: "claude", stateDir: path.join(root, "state") },
+        context: {},
+        onLog: async () => {},
+        onMeta: async () => {},
+      } as never);
+
+      const localExpected = new Date("2026-09-22T08:00:00.000Z");
+      localExpected.setHours(9, 0, 0, 0);
+      if (localExpected.getTime() <= Date.now()) localExpected.setDate(localExpected.getDate() + 1);
+      expect(result.errorCode).toBe("provider_quota");
+      expect(result.errorFamily).toBe("provider_quota");
+      expect(result.resultJson?.providerQuotaRetryNotBefore).toBe(
+        expectedRetryAt ?? localExpected.toISOString(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps an ordinary Claude ACP failure as acpx_turn_failed", async () => {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        ({
+          ensureSession: async () => okHandle,
+          startTurn: () => failedTurn("agent failed"),
+          close: async () => {},
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "ordinary-claude-failure",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "claude", stateDir: path.join(root, "state") },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorFamily).toBeNull();
+    expect(result.resultJson?.providerQuotaRetryNotBefore).toBeUndefined();
   });
 
   it("test_flush_child_stderr_runs_on_every_exit_path", async () => {

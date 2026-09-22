@@ -71,6 +71,12 @@ export {
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export {
+  buildClaudeProviderErrorHaystack,
+  extractClaudeProviderQuotaRetryNotBefore,
+  isClaudeProviderQuotaText,
+} from "./claude-provider-quota.js";
+export type { ClaudeProviderErrorInput } from "./claude-provider-quota.js";
+export {
   buildAdapterEnvConfig,
   parseEnvBindings,
   parseEnvVars,
