@@ -84,15 +84,26 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
     const roots = sharedSourceRoots.get(id) ?? new Set<string>();
     roots.add(cwd); sharedSourceRoots.set(id, roots);
   };
-  for (const entry of overlappingEntries) if (entry.kind === "source") addSharedSource(entry.scopeId, entry.canonicalCwd);
+  // Closed workspaces (closedAt set, or archived / cleanup_failed) no longer hold files that a
+  // root reader can reach, so they are not sources. Without this filter every never-closed or
+  // archived row of the company is re-resolved and re-authorized under the company-wide
+  // task-repository-roots lock, and the hold time grows without bound (upstream #16381).
+  const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd,
+    status: executionWorkspaces.status, closedAt: executionWorkspaces.closedAt }).from(executionWorkspaces)
+    .where(eq(executionWorkspaces.companyId, input.companyId));
+  const closedWorkspaceIds = new Set(workspaces
+    .filter(workspace => workspace.closedAt != null || workspace.status === "archived" || workspace.status === "cleanup_failed")
+    .map(workspace => workspace.id));
+  for (const entry of overlappingEntries) {
+    if (entry.kind === "source" && !closedWorkspaceIds.has(entry.scopeId)) addSharedSource(entry.scopeId, entry.canonicalCwd);
+  }
   const sharedSourceIds = new Set(sharedSourceRoots.keys());
-  const isolatedSourceIds = new Set(overlappingEntries.filter(entry => entry.kind === "isolated_source").map(entry => entry.scopeId));
+  const isolatedSourceIds = new Set(overlappingEntries
+    .filter(entry => entry.kind === "isolated_source" && !closedWorkspaceIds.has(entry.scopeId)).map(entry => entry.scopeId));
   const sourceIds = new Set([...sharedSourceIds, ...isolatedSourceIds]);
   if (input.sourceWorkspaceId) { sourceIds.add(input.sourceWorkspaceId); sharedSourceIds.add(input.sourceWorkspaceId); addSharedSource(input.sourceWorkspaceId, canonicalCwd); }
-  const workspaces = await tx.select({ id: executionWorkspaces.id, cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
-    .where(eq(executionWorkspaces.companyId, input.companyId));
   for (const workspace of workspaces) {
-    if (!workspace.cwd) continue;
+    if (!workspace.cwd || closedWorkspaceIds.has(workspace.id)) continue;
     const peerRoot = await canonicalRepositoryRoot(workspace.cwd).catch((error: NodeJS.ErrnoException) => {
       if (["ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
@@ -131,7 +142,10 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
     const matches = sourceIds.has(peer.workspaceId) || (peerRoot !== null && repositoryRootsOverlap(peerRoot, canonicalCwd))
       || (published && peerRoot === null && !knownOrigins.has(peer.id))
       || (peerRoot === null && !entries.some(entry => entry.kind === "reader") && peer.cwd && await legacyRepositoryRootMayMatch(peer.cwd, canonicalCwd));
-    if (matches) {
+    if (matches && closedWorkspaceIds.has(peer.workspaceId)) {
+      // A closed peer still proves provenance for its published directory, but is not a source.
+      if (published) recognizedNames.add(name);
+    } else if (matches) {
       sourceIds.add(peer.workspaceId);
       if (!isolatedSourceIds.has(peer.workspaceId) || (peerRoot && repositoryRootsOverlap(peerRoot, canonicalCwd))) {
         sharedSourceIds.add(peer.workspaceId); addSharedSource(peer.workspaceId, peerRoot ?? canonicalCwd);
@@ -533,7 +547,16 @@ export function executionWorkspaceRepositoryService(db: Db) {
     companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; issueId?: string; preserveOwnAdmission?: boolean;
   }) {
     const { canonicalCwd, rootKey, entries, overlappingEntries, sourceIds, sharedSourceIds, isolatedSourceIds, sourceProjectIds, sharedProjectIds, isolatedProjectIds } = await resolveRepositoryRootSources(tx, input);
-    const readers = overlappingEntries.filter(entry => entry.kind === "reader");
+    // Only readers whose run can still read the root need re-authorization. Readers retained for
+    // finished runs accumulate with every run and multiply the work done under the company-wide
+    // lock (upstream #16381), so they are skipped here and not re-inserted below.
+    const retainedReaders = overlappingEntries.filter(entry => entry.kind === "reader");
+    const liveReaderRunIds = retainedReaders.length ? new Set((await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId),
+      or(...retainedReaders.map(reader => eq(heartbeatRuns.id, reader.scopeId))),
+      or(eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.status, "running")),
+    ))).map(run => run.id)) : new Set<string>();
+    const readers = retainedReaders.filter(reader => liveReaderRunIds.has(reader.scopeId) || reader.scopeId === input.reader?.runId);
     if (input.reader && !entries.some(entry => entry.kind === "reader" && entry.scopeId === input.reader!.runId)) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.reader.runId), eq(heartbeatRuns.companyId, input.companyId)));
       readers.push({ id: randomUUID(), companyId: input.companyId, rootKey, canonicalCwd, kind: "reader", scopeId: input.reader.runId,
