@@ -1,3 +1,4 @@
+import os from "node:os";
 import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, getTableColumns, inArray, isNull, or, sql } from "drizzle-orm";
@@ -31,6 +32,9 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   const coordinators = await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runIds));
   const now = new Date();
+  // Anything that started before the last host boot cannot still be running; a live pid/pgid there is
+  // an unrelated process that reused the number (macOS recycles pids/pgids after reboot).
+  const bootedAt = new Date(Date.now() - os.uptime() * 1000);
   const abandoned = coordinators.filter(row => row.leaseOwner);
   if (abandoned.some(row => !row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
       runs.find(run => run.id === row.runId)?.status !== "cancelled")) return false;
@@ -52,6 +56,11 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
       if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
       continue;
     }
+    // Nothing that ran before the last host boot can still be executing locally. Skip the pid/pgid and
+    // cancellation-settlement checks for such runs: they trip on reused pids/pgids and on historical
+    // cancellations that were never acknowledged, and keep the agent in "pausing" forever.
+    const lastSeen = run.processStartedAt ?? run.finishedAt ?? run.startedAt;
+    if (lastSeen && lastSeen < bootedAt) continue;
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
     if (processAlive && run.processStartedAt) {
