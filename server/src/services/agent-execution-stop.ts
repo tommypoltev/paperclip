@@ -1,6 +1,6 @@
 import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -9,7 +9,19 @@ import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
-  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  // Every historical run of the agent is scanned here; a full-row select drags result_json (Codex
+  // stdout/stderr, megabytes per run) and context_snapshot for tens of thousands of rows and OOMs
+  // the server while pausing an agent. Keep the columns the checks below read, drop the payloads.
+  const { resultJson: _resultJson, contextSnapshot: _contextSnapshot, stdoutExcerpt: _stdoutExcerpt,
+    stderrExcerpt: _stderrExcerpt, usageJson: _usageJson, ...lightRunColumns } = getTableColumns(heartbeatRuns);
+  const runs = await db.select({
+    ...lightRunColumns,
+    resultJson: sql<(typeof heartbeatRuns.$inferSelect)["resultJson"]>`${heartbeatRuns.resultJson} - 'stdout' - 'stderr'`,
+    contextSnapshot: sql<(typeof heartbeatRuns.$inferSelect)["contextSnapshot"]>`null`,
+    stdoutExcerpt: sql<(typeof heartbeatRuns.$inferSelect)["stdoutExcerpt"]>`null`,
+    stderrExcerpt: sql<(typeof heartbeatRuns.$inferSelect)["stderrExcerpt"]>`null`,
+    usageJson: sql<(typeof heartbeatRuns.$inferSelect)["usageJson"]>`null`,
+  }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const leases = await db.select().from(environmentLeases).where(or(
     inArray(environmentLeases.heartbeatRunId, runIds),

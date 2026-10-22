@@ -3900,7 +3900,12 @@ export function heartbeatService(
 
   async function stopInvocationsForAgents(agentIds: string[], reason: string) {
     await cancelInvocationsForAgentsInternal(agentIds, reason);
-    const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+    // Only the columns the loop below needs: a full-row select pulls result_json/stdout for every
+    // historical run of the agent (tens of thousands of rows, gigabytes) and OOMs the server on pause.
+    const runs = await db.select({
+      id: heartbeatRuns.id, status: heartbeatRuns.status, companyId: heartbeatRuns.companyId,
+      agentId: heartbeatRuns.agentId, controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+    }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),
