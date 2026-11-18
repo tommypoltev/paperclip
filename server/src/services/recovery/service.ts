@@ -3428,10 +3428,10 @@ export function recoveryService(
       skipped: 0,
       issueIds: [] as string[],
     };
-    for (const { action, issue } of rows) {
+    async function reconcileAction(action: (typeof rows)[number]["action"], issue: (typeof rows)[number]["issue"]) {
       if (await hasUnverifiedNativeWorkspaceFinalizationOwner(db, action)) {
         result.skipped += 1;
-        continue;
+        return;
       }
       const wakePolicy = parseObject(action.wakePolicy);
       const wakePolicyType = readNonEmptyString(wakePolicy.type);
@@ -3440,7 +3440,7 @@ export function recoveryService(
         wakePolicyType !== "bounded_owner_disposition_repair" &&
         action.ownerType !== "board"
       ) {
-        continue;
+        return;
       }
 
       if (issue.status === "done" || issue.status === "cancelled") {
@@ -3456,7 +3456,7 @@ export function recoveryService(
           result.resolved += 1;
           result.issueIds.push(issue.id);
         }
-        continue;
+        return;
       }
 
       // A queued comment or healthy child cannot establish what the stopped
@@ -3468,13 +3468,25 @@ export function recoveryService(
         // A queued wake or healthy child does not export this accepted result.
         // Only its native finalizer or an explicit board disposition can settle it.
         result.skipped += 1;
-        continue;
+        return;
       }
 
+      // A child reachable through outgoing blocks cannot block its source:
+      // adding that reverse edge would make startup recovery create a cycle.
+      const descendants = await db.execute<{ id: string }>(sql`
+        with recursive descendants(id) as (
+          select ${issueRelations.relatedIssueId} from ${issueRelations}
+          where ${issueRelations.companyId} = ${issue.companyId}
+            and ${issueRelations.issueId} = ${issue.id} and ${issueRelations.type} = 'blocks'
+          union
+          select r.related_issue_id from issue_relations r join descendants d on r.issue_id = d.id
+          where r.company_id = ${issue.companyId} and r.type = 'blocks'
+        ) select id from descendants`);
+      const descendantIds = new Set(descendants.map(row => row.id));
       const [sourceState, healthyChildren, hasNewSourcePath] =
         await Promise.all([
           collectDispositionRepairSourceState(db, { issue }),
-          healthyOpenChildIssues(issue),
+          healthyOpenChildIssues(issue).then(children => children.filter(child => !descendantIds.has(child.id))),
           sourceHasNewPathOutsideRecoveryAction(action),
         ]);
       const durablePathRestored =
@@ -3515,7 +3527,7 @@ export function recoveryService(
           result.resolved += 1;
           result.issueIds.push(issue.id);
         }
-        continue;
+        return;
       }
 
       if (wakePolicyType === "bounded_owner_disposition_repair") {
@@ -3528,7 +3540,7 @@ export function recoveryService(
           )
         ) {
           result.skipped += 1;
-          continue;
+          return;
         }
 
         const latestRun = await latestRecoveryActionRun(action);
@@ -3551,14 +3563,22 @@ export function recoveryService(
         } else {
           result.skipped += 1;
         }
-        continue;
+        return;
       }
 
-      if (action.ownerType === "board") continue;
+      if (action.ownerType === "board") return;
 
       // Legacy takeover actions remain readable and resolvable, but recovery no
       // longer schedules another agent-owned wake for them.
       result.skipped += 1;
+    }
+    for (const { action, issue } of rows) {
+      try {
+        await reconcileAction(action, issue);
+      } catch (error) {
+        logger.error({ err: error, actionId: action.id, issueId: issue.id }, "Skipping failed recovery action reconciliation");
+        result.skipped += 1;
+      }
     }
     return result;
   }

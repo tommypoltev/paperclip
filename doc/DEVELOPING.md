@@ -2338,3 +2338,9 @@ Storybook: **Skills → Project repository skills**. Its production UI journeys 
 in-memory provider and execution fixtures. Live GitHub refresh and execution need
 separate acceptance evidence. Run the focused browser suite against built Storybook,
 or set `STORYBOOK_TEST_BASE_URL` to an owned Storybook dev server.
+
+### Legacy run concurrency
+
+`PAPERCLIP_MAX_CONCURRENT_RUNS` sets an optional instance-wide limit for running legacy adapter runs across all companies. A positive integer enables the limit; unset, zero, or invalid values keep the default unlimited behavior. Native runs are excluded. Excess runs stay queued and the normal queue sweep retries them when capacity is available. Claims serialize with a non-blocking transaction advisory lock; they never reserve a slot outside the claim transaction.
+
+The controller lease is 180 seconds and renews every 10 seconds. `DATABASE_POOL_MAX` already maps to the postgres.js `max` option; operators can size the connection pool independently of the run limit.

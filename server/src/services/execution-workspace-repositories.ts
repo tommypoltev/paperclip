@@ -20,7 +20,7 @@ import { normalizeProjectRepositoryUrl } from "./project-repositories.js";
 import { buildGitAuthInvocation, createGitRemoteAuthProvider } from "./git-credentials.js";
 import { materializeManagedProjectWorkspace, ensureManagedRepositoriesIgnored } from "./managed-repository-checkout.js";
 
-import { canonicalRepositoryRoot, repositoryRootsOverlap, legacyRepositoryRootMayMatch, configuredWorkspaceRoot, verifiedIsolatedWorktree, unusedIsolatedCopyTarget, isolatedWorkspaceSourceRoots, type WorkspaceSourceCopyKind } from "./execution-workspace-source-roots.js";
+import { canonicalRepositoryRoot, repositoryRootsOverlap, legacyRepositoryRootMayMatch, configuredWorkspaceRoot, verifiedIsolatedWorktree, unusedIsolatedCopyTarget, isolatedWorkspaceSourceRoots, scopedRealpath, withRepositoryRootFsScope, type WorkspaceSourceCopyKind } from "./execution-workspace-source-roots.js";
 export { canonicalRepositoryRoot } from "./execution-workspace-source-roots.js";
 
 const execFile = promisify(execFileCallback);
@@ -135,7 +135,7 @@ async function resolveRepositoryRootSources(tx: Db | DbTransaction, input: {
   for (const peer of inventory) {
     const name = path.basename(taskRepositoryRelativePath(peer.identity));
     const published = publishedNames.has(name);
-    const peerRoot = peer.cwd ? await fs.realpath(peer.cwd).catch((error: NodeJS.ErrnoException) => {
+    const peerRoot = peer.cwd ? await scopedRealpath(peer.cwd).catch((error: NodeJS.ErrnoException) => {
       if (["ENOENT", "ENOTDIR", "EACCES", "EPERM", "ELOOP", "ENAMETOOLONG"].includes(error.code ?? "")) return null;
       throw error;
     }) : null;
@@ -209,6 +209,25 @@ async function retainedRootReader(tx: DbTransaction, companyId: string, reader: 
 
 export async function lockExecutionWorkspaceRootProvenance(tx: DbTransaction, companyId: string) {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0))`);
+}
+
+/** Run `fn` under the company-wide root lock after resolving `cwds` on disk without it, so
+ * the locked transaction reuses those filesystem and git results instead of sitting idle
+ * in transaction while it walks every workspace of the company. Database reads inside the
+ * lock stay fresh; the unlocked pass only primes filesystem results and its errors are
+ * ignored, because the locked pass repeats any failed check live. */
+async function withRootProvenanceLock<T>(db: Db, companyId: string, cwds: Iterable<string | null | undefined>,
+  fn: (tx: DbTransaction) => Promise<T>, prime?: () => Promise<unknown>): Promise<T> {
+  return withRepositoryRootFsScope(async () => {
+    for (const cwd of new Set(cwds)) {
+      if (cwd) await resolveRepositoryRootSources(db, { companyId, cwd, inspectCurrentAliases: true }).catch(() => undefined);
+    }
+    await prime?.().catch(() => undefined);
+    return db.transaction(async tx => {
+      await lockExecutionWorkspaceRootProvenance(tx, companyId);
+      return fn(tx);
+    });
+  });
 }
 
 export async function preserveConfiguredProjectWorkspaceRootProvenance(tx: DbTransaction, input: {
@@ -287,8 +306,7 @@ export async function assertIsolatedWorkspaceSourceReadAccess(db: Db, input: {
   companyId: string; sourceCwd: string; actor: AuthorizationActor; copyKind?: WorkspaceSourceCopyKind;
 }): Promise<IsolatedWorkspaceSourceAccess> {
   const { roots, commonRoot } = await isolatedWorkspaceSourceRoots(db, input.companyId, input.sourceCwd, input.copyKind);
-  return db.transaction(async tx => {
-    await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
+  return withRootProvenanceLock(db, input.companyId, [...roots, commonRoot], async tx => {
     const workspaceIds = new Set<string>(), projectIds = new Set<string>();
     for (const cwd of roots) {
       const closure = await resolveRepositoryRootSources(tx, { companyId: input.companyId, cwd, inspectCurrentAliases: true });
@@ -315,8 +333,7 @@ export async function retainIsolatedWorkspaceSourceAccess(db: Db, input: {
   catch (error) { sourceFailure = error; }
   const canonicalCwd = await canonicalRepositoryRoot(input.targetCwd);
   const rootKey = createHash("sha256").update(canonicalCwd).digest("hex");
-  const denied = await db.transaction(async tx => {
-    await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
+  const denied = await withRootProvenanceLock(db, input.companyId, [...roots, canonicalCwd], async tx => {
     const existing = await tx.select().from(executionWorkspaceRepositoryAccess).where(and(
       eq(executionWorkspaceRepositoryAccess.companyId, input.companyId), eq(executionWorkspaceRepositoryAccess.rootKey, rootKey)));
     if (existing.some(entry => entry.canonicalCwd !== canonicalCwd)) throw forbidden("Repository root identity conflicts with its retained access record");
@@ -380,7 +397,7 @@ export async function retainIsolatedWorkspaceSourceAccess(db: Db, input: {
       }
     }
     return failure;
-  });
+  }, () => input.copyKind !== "repository" ? verifiedIsolatedWorktree(canonicalCwd, roots) : Promise.resolve());
   if (denied) throw denied;
 }
 
@@ -609,16 +626,10 @@ export function executionWorkspaceRepositoryService(db: Db) {
     }
   }
   async function reserveRootAccess(input: Parameters<typeof authorizeRootAccess>[1]) {
-    return db.transaction(async tx => {
-      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
-      await authorizeRootAccess(tx, input);
-    });
+    return withRootProvenanceLock(db, input.companyId, [input.cwd], tx => authorizeRootAccess(tx, input));
   }
   async function reserveAdmissionRoot(companyId: string, cwd: string, mode: "anonymous_only" | "managed") {
-    return db.transaction(async tx => {
-      await lockExecutionWorkspaceRootProvenance(tx, companyId);
-      return reserveRootPolicy(tx, companyId, cwd, mode);
-    });
+    return withRootProvenanceLock(db, companyId, [cwd], tx => reserveRootPolicy(tx, companyId, cwd, mode));
   }
   async function request(input: { companyId: string; issueId: string; actor: AuthorizationActor; request: PrepareWorkspaceRepository }) {
     const parsed = prepareWorkspaceRepositorySchema.parse(input.request);
@@ -641,8 +652,9 @@ export function executionWorkspaceRepositoryService(db: Db) {
     }
     const available = await catalog(input.companyId, userId, localTrusted);
     const requestedRef = parsed.ref ?? "HEAD";
-    const receipt = await db.transaction(async tx => {
-      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
+    const [requestedWorkspace] = requestedIssue.executionWorkspaceId ? await db.select({ cwd: executionWorkspaces.cwd }).from(executionWorkspaces)
+      .where(and(eq(executionWorkspaces.id, requestedIssue.executionWorkspaceId), eq(executionWorkspaces.companyId, input.companyId))) : [];
+    const receipt = await withRootProvenanceLock(db, input.companyId, [requestedWorkspace?.cwd], async tx => {
       const [issue] = await tx.select().from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId), await issueReadSqlCondition(tx, input.actor))).for("no key update");
       if (!issue) throw notFound("Task not found");
       const currentDecision = await authorizationService(tx).decide({ actor: input.actor, action: "issue:mutate", resource: issueResource(issue) });
@@ -704,8 +716,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
     return { workspace, actor };
   }
   async function guardForPublication(input: PublicationInput) {
-    await db.transaction(async tx => {
-      await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
+    await withRootProvenanceLock(db, input.companyId, [input.cwd], async tx => {
       const { workspace } = await publicationBinding(tx, input);
       await authorizeRootAccess(tx, { companyId: input.companyId, cwd: input.cwd, sourceWorkspaceId: workspace.id, reader: input });
     });
@@ -721,8 +732,7 @@ export function executionWorkspaceRepositoryService(db: Db) {
         commonRoot = source.commonRoot;
         for (const cwd of source.roots) roots.add(cwd);
       } catch (error) { sourceFailure = error; }
-      const denied = await db.transaction(async tx => {
-        await lockExecutionWorkspaceRootProvenance(tx, input.companyId);
+      const denied = await withRootProvenanceLock(db, input.companyId, [...roots, input.cwd, commonRoot], async tx => {
         const { workspace, actor } = await publicationBinding(tx, input);
         const canonicalCwd = await canonicalRepositoryRoot(input.cwd);
         const rootKey = createHash("sha256").update(canonicalCwd).digest("hex");

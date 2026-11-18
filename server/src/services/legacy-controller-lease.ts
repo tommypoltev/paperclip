@@ -5,8 +5,11 @@ import type { LegacyControllerLeaseLossCause } from "./run-cancellation.js";
 
 // A boot UUID has meaning across containers; a numeric PID does not.
 export const legacyControllerBootId = randomUUID();
-export const LEGACY_CONTROLLER_LEASE_MS = 60_000;
+// Renewal runs every 10s; the 180s lease tolerates a renewal stuck behind pool
+// starvation under heavy concurrency without aborting healthy runs.
+export const LEGACY_CONTROLLER_LEASE_MS = 180_000;
 export const LEGACY_CONTROLLER_RENEW_MS = 10_000;
+const leaseInterval = sql.raw(`interval '${LEGACY_CONTROLLER_LEASE_MS / 1000} seconds'`);
 
 type Run = typeof heartbeatRuns.$inferSelect;
 
@@ -23,7 +26,7 @@ export function legacyControllerClaim(runtimeMode: string) {
   if (runtimeMode === "native") return {};
   return {
     controllerBootId: legacyControllerBootId,
-    controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+    controllerLeaseExpiresAt: sql`clock_timestamp() + ${leaseInterval}`,
     executionStage: "preparing",
   };
 }
@@ -34,7 +37,7 @@ export async function renewLegacyControllerLease(
   stage?: "dispatching",
 ): Promise<boolean> {
   const [renewed] = await db.update(heartbeatRuns).set({
-    controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+    controllerLeaseExpiresAt: sql`clock_timestamp() + ${leaseInterval}`,
     ...(stage ? { executionStage: stage } : {}),
   }).where(and(
     eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
@@ -61,7 +64,7 @@ export async function revokeExpiredLegacyController(db: Db, run: Run): Promise<b
   if (run.runtimeMode === "native" || !run.controllerBootId) return true;
   const [revoked] = await db.update(heartbeatRuns).set({
     controllerBootId: randomUUID(),
-    controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+    controllerLeaseExpiresAt: sql`clock_timestamp() + ${leaseInterval}`,
   }).where(and(
     eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
     eq(heartbeatRuns.status, "running"),

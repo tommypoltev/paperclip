@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
@@ -10,7 +11,38 @@ import { localRepositoryPath } from "./local-repository-path.js";
 const execFile = promisify(execFileCallback);
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
-export async function canonicalRepositoryRoot(cwd: string): Promise<string> {
+// Root resolution walks every workspace of the company on disk and runs git. Under the
+// company-wide task-repository-roots lock that kept the transaction idle for minutes while
+// other preparations held pool connections waiting for the lock. A scope lets a caller
+// resolve before taking the lock and reuse the results inside it. The advisory lock never
+// guarded the filesystem, so a result from moments earlier is as current as a fresh read.
+// Failures are not retained: the locked pass retries them live.
+const rootFsResults = new AsyncLocalStorage<Map<string, Promise<unknown>>>();
+
+export function withRepositoryRootFsScope<T>(fn: () => Promise<T>): Promise<T> {
+  return rootFsResults.run(new Map(), fn);
+}
+
+function scoped<T>(key: string, compute: () => Promise<T>): Promise<T> {
+  const results = rootFsResults.getStore();
+  if (!results) return compute();
+  const known = results.get(key) as Promise<T> | undefined;
+  if (known) return known;
+  const pending = compute();
+  results.set(key, pending);
+  pending.catch(() => { if (results.get(key) === pending) results.delete(key); });
+  return pending;
+}
+
+export function scopedRealpath(cwd: string): Promise<string> {
+  return scoped(`realpath\0${cwd}`, () => fs.realpath(cwd));
+}
+
+export function canonicalRepositoryRoot(cwd: string): Promise<string> {
+  return scoped(`canonical\0${cwd}`, () => resolveCanonicalRepositoryRoot(cwd));
+}
+
+async function resolveCanonicalRepositoryRoot(cwd: string): Promise<string> {
   const absolute = path.resolve(cwd);
   try { return await fs.realpath(absolute); }
   catch (error) {
@@ -29,7 +61,11 @@ export function repositoryRootsOverlap(left: string, right: string): boolean {
   return contains(left, right) || contains(right, left);
 }
 
-export async function legacyRepositoryRootMayMatch(cwd: string, candidate: string): Promise<boolean> {
+export function legacyRepositoryRootMayMatch(cwd: string, candidate: string): Promise<boolean> {
+  return scoped(`legacy\0${cwd}\0${candidate}`, () => resolveLegacyRepositoryRootMayMatch(cwd, candidate));
+}
+
+async function resolveLegacyRepositoryRootMayMatch(cwd: string, candidate: string): Promise<boolean> {
   const absolute = path.resolve(cwd);
   let probe = absolute;
   let suffix = "";
@@ -53,7 +89,11 @@ export async function legacyRepositoryRootMayMatch(cwd: string, candidate: strin
   }
 }
 
-export async function configuredWorkspaceRoot(input: { cwd: string | null; repoUrl?: string | null }, scan: boolean): Promise<string | null> {
+export function configuredWorkspaceRoot(input: { cwd: string | null; repoUrl?: string | null }, scan: boolean): Promise<string | null> {
+  return scoped(`configured\0${input.cwd ?? ""}\0${input.repoUrl ?? ""}\0${scan}`, () => resolveConfiguredWorkspaceRoot(input, scan));
+}
+
+async function resolveConfiguredWorkspaceRoot(input: { cwd: string | null; repoUrl?: string | null }, scan: boolean): Promise<string | null> {
   const resolveDirectory = async (cwd: string): Promise<string | null> => {
     try {
       const entry = await fs.stat(cwd);
@@ -78,7 +118,12 @@ export async function configuredWorkspaceRoot(input: { cwd: string | null; repoU
   return repositoryPath ? resolveDirectory(repositoryPath) : null;
 }
 
-export async function verifiedIsolatedWorktree(cwd: string, allowedOwnerRoots?: Set<string>): Promise<boolean> {
+export function verifiedIsolatedWorktree(cwd: string, allowedOwnerRoots?: Set<string>): Promise<boolean> {
+  const owners = allowedOwnerRoots ? [...allowedOwnerRoots].sort().join("\0") : "*";
+  return scoped(`worktree\0${cwd}\0${owners}`, () => resolveVerifiedIsolatedWorktree(cwd, allowedOwnerRoots));
+}
+
+async function resolveVerifiedIsolatedWorktree(cwd: string, allowedOwnerRoots?: Set<string>): Promise<boolean> {
   try {
     const directory = await fs.lstat(cwd), marker = await fs.lstat(path.join(cwd, ".git"));
     if (!directory.isDirectory() || directory.isSymbolicLink() || !marker.isFile() || marker.isSymbolicLink() || marker.size > 4096) return false;

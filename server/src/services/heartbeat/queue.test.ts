@@ -1,7 +1,7 @@
 import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { createRunDispatch } from "../../modules/run-dispatch/index.js";
 import type { createWakeQueue } from "../../modules/wake-queue/index.js";
@@ -139,8 +139,10 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     await db.execute(sql`truncate table companies restart identity cascade`);
   });
 
-  async function fixture(status = "running") {
-    const [company] = await db.insert(companies).values({ name: "Queue module", issuePrefix: "QM" }).returning();
+  afterEach(() => vi.unstubAllEnvs());
+
+  async function fixture(status = "running", issuePrefix = "QM") {
+    const [company] = await db.insert(companies).values({ name: "Queue module", issuePrefix }).returning();
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Queue agent", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Queue task", status: "todo", assigneeAgentId: agent.id }).returning();
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "assignment", status: "claimed", claimedAt: new Date() }).returning();
@@ -169,6 +171,37 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     await createHeartbeatQueue(db, callbacks(db)).releaseRunClaimedJustBeforeSuppression(run.id);
     const [current] = await db.select().from(issues).where(eq(issues.id, issue.id));
     expect(current.executionRunId).toBe(newOwner.id);
+  });
+
+  it.each(["legacy", "native"] as const)("resumes %s claims under a cross-company legacy capacity limit", async (runtimeMode) => {
+    vi.stubEnv("PAPERCLIP_MAX_CONCURRENT_RUNS", "1");
+    const busy = await fixture();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy" }).where(eq(heartbeatRuns.id, busy.run.id));
+    const waiting = await fixture("queued", "QW");
+    expect(waiting.company.id).not.toBe(busy.company.id);
+    await db.update(heartbeatRuns).set({ runtimeMode, responsibleUserId: "queue-test-user" }).where(eq(heartbeatRuns.id, waiting.run.id));
+    await db.update(agentWakeupRequests).set({ status: "queued", claimedAt: null }).where(eq(agentWakeupRequests.id, waiting.wake.id));
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(waiting.agent);
+    deps.setWakeupStatus.mockImplementation(async (id, status, patch) => {
+      if (id) await db.update(agentWakeupRequests).set({ ...patch, status }).where(eq(agentWakeupRequests.id, id));
+    });
+    const queue = createHeartbeatQueue(db, deps);
+    const readRun = () => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, waiting.run.id)).then(rows => rows[0]);
+    const readWake = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.wake.id)).then(rows => rows[0]);
+
+    await queue.resumeQueuedRuns();
+    if (runtimeMode === "legacy") {
+      expect(await readRun()).toMatchObject({ status: "queued", startedAt: null, errorCode: null });
+      expect(await readWake()).toMatchObject({ status: "queued", claimedAt: null });
+      expect(deps.executeRun).not.toHaveBeenCalled();
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busy.run.id));
+      await queue.resumeQueuedRuns();
+    }
+    expect(await readRun()).toMatchObject({ status: "running", startedAt: expect.any(Date), wakeupRequestId: waiting.wake.id });
+    expect(await readWake()).toMatchObject({ status: "claimed", claimedAt: expect.any(Date) });
+    expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(waiting.run.id);
+    await Promise.all(deps.activeRunExecutionPromises);
   });
 
   it("cancels at the daily run cap before claiming or dispatching", async () => {
