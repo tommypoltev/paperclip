@@ -24,6 +24,7 @@ import {
   isConversationExecutionWake,
   isWaitingConversation,
 } from "../agent-conversations.js";
+import { legacyRunCapacityAvailable } from "./run-capacity.js";
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import {
   admitExplicitNativeContinuation,
@@ -1223,6 +1224,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
               // this claim observes the cancelled queue and does no work.
+              if (!(await legacyRunCapacityAvailable(tx, run.runtimeMode))) return { kind: "stale" as const, run: null };
               const issueClaim = await lockIssueExecutionClaim(tx as unknown as Db);
               if (issueClaim.blocked) return { kind: "stale" as const, run: null };
               const wake = await tx
@@ -1545,6 +1547,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
           }
           return tx.transaction(async (claimTx) => {
+            if (!(await legacyRunCapacityAvailable(claimTx, run.runtimeMode))) return null;
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
