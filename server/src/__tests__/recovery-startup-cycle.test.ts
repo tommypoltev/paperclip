@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { logger } from "../middleware/logger.js";
 import * as disposition from "../services/recovery/disposition-repair.js";
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("startup recovery cycle isolation", () => {
@@ -27,7 +28,13 @@ const support = await getEmbeddedPostgresTestSupport();
       { companyId: company.id, issueId: source.id, relatedIssueId: middle.id, type: "blocks" },
       { companyId: company.id, issueId: middle.id, relatedIssueId: child.id, type: "blocks" },
     ] : [{ companyId: company.id, issueId: source.id, relatedIssueId: child.id, type: "blocks" }]);
-    await expect(recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues({ issueCreatedAtGte: new Date("2100-01-01") })).resolves.toBeDefined();
+    const errors = vi.spyOn(logger, "error");
+    try {
+      await expect(recoveryService(db, { enqueueWakeup: vi.fn() }).reconcileStrandedAssignedIssues({ issueCreatedAtGte: new Date("2100-01-01") })).resolves.toBeDefined();
+      expect(errors).not.toHaveBeenCalledWith(
+        expect.objectContaining({ actionId: action.id }), "Skipping failed recovery action reconciliation",
+      );
+    } finally { errors.mockRestore(); }
     const links = await db.select().from(issueRelations).where(eq(issueRelations.relatedIssueId, source.id));
     expect(links).toHaveLength(0);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0].status).toBe("active");
