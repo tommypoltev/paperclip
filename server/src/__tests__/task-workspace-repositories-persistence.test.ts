@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import { sql } from "drizzle-orm";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -244,4 +246,38 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(issue.workspacePendingSelection?.requestKey).toBe("move");
     expect(issue.workspaceBindingRevision).toBe(1);
   });
+  it("resolves slow workspace roots before holding the company provenance lock", async () => {
+    const [{ id: companyId }] = await db.insert(companies).values({ name: "Root lock", issuePrefix: "ROOTLOCK" }).returning();
+    const cwd = await mkdtemp(path.join(tmpdir(), "lock-target-"));
+    const [workspace] = await db.insert(executionWorkspaces).values({ companyId, name: "Target", cwd,
+      mode: "shared_workspace", strategyType: "operator_directory" }).returning();
+    const [task] = await db.insert(issues).values({ companyId, title: "Root lock", executionWorkspaceId: workspace.id }).returning();
+    const peerRoot = await mkdtemp(path.join(tmpdir(), "slow-root-"));
+    const [peer] = await db.insert(executionWorkspaces).values({ companyId, name: "Slow peer", cwd: peerRoot,
+      mode: "shared_workspace", strategyType: "operator_directory" }).returning();
+    const original = fs.realpath;
+    let checks = 0;
+    const spy = vi.spyOn(fs, "realpath").mockImplementation(async (...args: Parameters<typeof fs.realpath>) => {
+      if (args[0] === peerRoot) {
+        checks += 1;
+        // A separate connection must be able to take the same lock during disk IO.
+        await db.transaction(async tx => {
+          const [row] = await tx.execute<{ acquired: boolean }>(sql`select pg_try_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0)) as acquired`);
+          expect(row.acquired).toBe(true);
+        });
+      }
+      return original(...args);
+    });
+    try {
+      await executionWorkspaceRepositoryService(db).request({ companyId, issueId: task.id, actor,
+        request: { repository: { kind: "catalog", id: "123" }, requestKey: "slow-root-regression" } });
+      expect(checks).toBe(1);
+    } finally {
+      spy.mockRestore();
+      await db.delete(executionWorkspaces).where(eq(executionWorkspaces.id, peer.id));
+      await rm(peerRoot, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
 });
