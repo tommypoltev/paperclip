@@ -4,7 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "./heartbeat.js";
-import { hasLiveLegacyController, LEGACY_CONTROLLER_RENEW_MS, legacyControllerBootId, legacyControllerClaim, LegacyControllerLeaseLostError,
+import { hasLiveLegacyController, LEGACY_CONTROLLER_LEASE_MS, LEGACY_CONTROLLER_RENEW_MS, legacyControllerBootId, legacyControllerClaim, LegacyControllerLeaseLostError,
   renewLegacyControllerLease, revokeExpiredLegacyController, watchLegacyControllerLease } from "./legacy-controller-lease.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -34,6 +34,27 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(run).toMatchObject({ status: "running", controllerBootId: legacyControllerBootId, executionStage: "preparing", processPid: null });
     expect(await hasLiveLegacyController(db, run)).toBe(true);
     expect(await revokeExpiredLegacyController(db, run)).toBe(false);
+  });
+  it("claim, renewal and revocation all grant the full 180s lease", async () => {
+    expect(LEGACY_CONTROLLER_LEASE_MS).toBe(180_000);
+    const remainingMs = async (id: string) => {
+      const [row] = await db.select({ ms: sql<number>`extract(epoch from (${heartbeatRuns.controllerLeaseExpiresAt} - clock_timestamp())) * 1000` })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, id));
+      return Number(row.ms);
+    };
+    const expectFullLease = (ms: number) => {
+      expect(ms).toBeGreaterThan(LEGACY_CONTROLLER_LEASE_MS - 10_000);
+      expect(ms).toBeLessThanOrEqual(LEGACY_CONTROLLER_LEASE_MS);
+    };
+    const run = await seed();
+    expectFullLease(await remainingMs(run.id));
+    await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() + interval '5 seconds'` })
+      .where(eq(heartbeatRuns.id, run.id));
+    expect(await renewLegacyControllerLease(db, run)).toBe(true);
+    expectFullLease(await remainingMs(run.id));
+    await expire(run.id);
+    expect(await revokeExpiredLegacyController(db, run)).toBe(true);
+    expectFullLease(await remainingMs(run.id));
   });
   it("another deployment's startup reaper preserves an unexpired controller", async () => {
     const run = await seed();
