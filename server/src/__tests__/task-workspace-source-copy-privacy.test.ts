@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { agents, authUsers, companies, companyMemberships, createDb, executionWorkspaceRepositoryRoots, executionWorkspaceRepositoryAccess, executionWorkspaceRepositories, executionWorkspaces,
   heartbeatRuns, issueAccessGrants, issues, projects, projectWorkspaces, projectAccessMembers, principalPermissionGrants, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { assertExecutionWorkspaceRootReadAccess, assertExecutionWorkspaceRootWriteAccess, assertIsolatedWorkspaceSourceReadAccess, retainIsolatedWorkspaceSourceAccess, executionWorkspaceRepositoryService } from "../services/execution-workspace-repositories.js";
@@ -107,6 +107,42 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(entries.some(entry => entry.kind === "isolated_project_source" && entry.scopeId === projectId)).toBe(true);
     expect(entries.some(entry => entry.kind === "isolated_copy")).toBe(false);
     expect(await readFile(path.join(f.admission.cwd, "source.txt"), "utf8")).toBe("Low-trust source\n");
+  });
+
+  it("does not re-authorize readers retained for finished runs under the root lock", async () => {
+    const f = await fixture(), exec = promisify(execFileCallback);
+    await f.service.prepareForAdmission(f.admission);
+    const sourceCwd = path.join(root, `${f.issueId}-finished-reader-source`);
+    await mkdir(sourceCwd);
+    await exec("git", ["init", "--initial-branch=main", sourceCwd]);
+    await writeFile(path.join(sourceCwd, "source.txt"), "Low-trust source\n");
+    await exec("git", ["-C", sourceCwd, "add", "."]);
+    await exec("git", ["-C", sourceCwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "source"]);
+    await rm(f.admission.cwd, { recursive: true });
+    await exec("git", ["-C", sourceCwd, "worktree", "add", "-b", "target", f.admission.cwd]);
+    const projectId = randomUUID();
+    const policy = { ...f.policy, authorizationPolicy: { ...f.policy.authorizationPolicy,
+      trustBoundary: { ...f.policy.authorizationPolicy.trustBoundary, projectIds: [projectId] } } };
+    await db.insert(projects).values({ id: projectId, companyId: f.companyId, name: "Low-trust copied source", executionWorkspacePolicy: policy });
+    await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId, name: "Source", cwd: sourceCwd });
+    await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issueId));
+    // The admitted reader is incompatible with the low-trust source; once its run finishes it can
+    // no longer read the root, so it must neither be re-checked nor block the copy, and the next
+    // root pass prunes its row.
+    const readerOf = async (runId: string) => (await db.select().from(executionWorkspaceRepositoryAccess).where(and(
+      eq(executionWorkspaceRepositoryAccess.kind, "reader"), eq(executionWorkspaceRepositoryAccess.scopeId, runId)))).length;
+    expect(await readerOf(f.runId)).toBeGreaterThan(0);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId,
+      status: "running", contextSnapshot: { issueId: f.issueId, executionPolicy: policy } });
+    const actor = { ...f.actor, runId };
+    const captured = await assertIsolatedWorkspaceSourceReadAccess(db, { companyId: f.companyId, sourceCwd, actor });
+    await expect(retainIsolatedWorkspaceSourceAccess(db, { companyId: f.companyId, sourceCwd, targetCwd: f.admission.cwd,
+      actor, issueId: f.issueId, captured, phase: "verified" })).resolves.toBeUndefined();
+    const entries = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    expect(await readerOf(f.runId)).toBe(0);
+    expect(entries.some(entry => entry.kind === "isolated_copy" && entry.scopeId === projectId)).toBe(true);
   });
 
   it.each([
@@ -492,7 +528,7 @@ exec "$PROBE_REAL_GIT" "$@"
     expect(captured.projectIds.includes(project.id)).toBe(owner !== "unrelated");
   });
 
-  it.each(["deleted_primary", "retained_reader"] as const)("retains separate metadata privacy across %s", async scenario => {
+  it.each(["deleted_primary", "retained_reader", "finished_reader"] as const)("retains separate metadata privacy across %s", async scenario => {
     const f = await fixture(), exec = promisify(execFileCallback);
     const storageParent = path.join(root, `${f.issueId}-deleted-primary-storage`);
     const metadata = path.join(storageParent, "metadata"), linked = path.join(root, `${f.issueId}-surviving-linked`);
@@ -507,7 +543,7 @@ exec "$PROBE_REAL_GIT" "$@"
     const input = { companyId: f.companyId, sourceCwd: f.admission.cwd, actor: f.actor, copyKind: "repository" as const };
     await expect(assertIsolatedWorkspaceSourceReadAccess(db, input)).rejects.toThrow(/source project/);
     expect(await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId))).toEqual([]);
-    const peer = scenario === "retained_reader" ? await standardPeer(f) : null;
+    const peer = scenario !== "deleted_primary" ? await standardPeer(f) : null;
     if (peer) {
       await db.update(executionWorkspaces).set({ cwd: metadata }).where(eq(executionWorkspaces.id, peer.workspace.id));
       await f.service.prepareForAdmission({ ...peer.admission, cwd: metadata });
@@ -516,6 +552,17 @@ exec "$PROBE_REAL_GIT" "$@"
       { companyId: f.companyId, projectId: project.id, subjectType: "agent", subjectId: f.agentId },
       { companyId: f.companyId, projectId: project.id, subjectType: "user", subjectId: f.userId },
     ]);
+    if (peer && scenario === "finished_reader") {
+      // A reader retained on the Git metadata root for a finished run can no longer read it, so it
+      // neither blocks nor survives the next root pass (OFM-11143).
+      const readerRows = () => db.select().from(executionWorkspaceRepositoryAccess).where(and(
+        eq(executionWorkspaceRepositoryAccess.kind, "reader"), eq(executionWorkspaceRepositoryAccess.scopeId, peer.runId)));
+      expect(await readerRows()).toContainEqual(expect.objectContaining({ canonicalCwd: await realpath(metadata) }));
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, peer.runId));
+      await expect(assertIsolatedWorkspaceSourceReadAccess(db, input)).resolves.toMatchObject({ projectIds: expect.arrayContaining([project.id]) });
+      expect(await readerRows()).toEqual([]);
+      return;
+    }
     if (peer) {
       await expect(assertIsolatedWorkspaceSourceReadAccess(db, input)).rejects.toThrow(/source project/);
       const before = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));

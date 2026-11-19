@@ -4,7 +4,7 @@ import { isDeepStrictEqual, promisify } from "node:util";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
-import { and, eq, isNotNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, notExists, or, sql } from "drizzle-orm";
 import { activityLog, agents, heartbeatRuns, projects, projectWorkspaces, executionWorkspaceRepositoryAccess, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -207,6 +207,38 @@ async function retainedRootReader(tx: DbTransaction, companyId: string, reader: 
   return { actor, issue };
 }
 
+/** Retained readers whose run can still read the root, plus the reader of `currentRunId`.
+ * Readers retained for finished runs accumulate with every run and multiply the work done
+ * under the company-wide lock (upstream #16381), so every reader re-authorization skips them. */
+async function liveRootReaders<T extends Pick<typeof executionWorkspaceRepositoryAccess.$inferSelect, "kind" | "scopeId">>(
+  tx: DbTransaction, companyId: string, entries: T[], currentRunId?: string): Promise<T[]> {
+  const retainedReaders = entries.filter(entry => entry.kind === "reader");
+  if (!retainedReaders.length) return [];
+  const liveRunIds = new Set((await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, companyId),
+    inArray(heartbeatRuns.id, [...new Set(retainedReaders.map(reader => reader.scopeId))]),
+    inArray(heartbeatRuns.status, ["queued", "running"]),
+  ))).map(run => run.id));
+  return retainedReaders.filter(reader => liveRunIds.has(reader.scopeId) || reader.scopeId === currentRunId);
+}
+
+/** Delete reader rows whose run is no longer queued or running. Every root pass loads all
+ * access rows of the company, so finished-run readers cost work even where they are skipped.
+ * Must run under the root lock: readers are only inserted under it, and a pass that re-admits
+ * its own run re-inserts that run's reader. Run status writes are spread over many terminal
+ * paths, so pruning here rather than on run completion also covers reaped and recovered runs. */
+async function pruneFinishedRootReaders(tx: DbTransaction, companyId: string) {
+  await tx.delete(executionWorkspaceRepositoryAccess).where(and(
+    eq(executionWorkspaceRepositoryAccess.companyId, companyId),
+    eq(executionWorkspaceRepositoryAccess.kind, "reader"),
+    notExists(tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, executionWorkspaceRepositoryAccess.scopeId),
+      eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.status, ["queued", "running"]),
+    ))),
+  ));
+}
+
 export async function lockExecutionWorkspaceRootProvenance(tx: DbTransaction, companyId: string) {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0))`);
 }
@@ -225,6 +257,7 @@ async function withRootProvenanceLock<T>(db: Db, companyId: string, cwds: Iterab
     await prime?.().catch(() => undefined);
     return db.transaction(async tx => {
       await lockExecutionWorkspaceRootProvenance(tx, companyId);
+      await pruneFinishedRootReaders(tx, companyId);
       return fn(tx);
     });
   });
@@ -289,7 +322,7 @@ async function retainGitMetadataOwners(tx: DbTransaction, input: {
   const closure = await resolveRepositoryRootSources(tx, { companyId: input.companyId, cwd: input.commonRoot, inspectCurrentAliases: true });
   const workspaceIds = new Set([...closure.sourceIds, ...input.workspaceIds]);
   const projectIds = new Set([...closure.sourceProjectIds, ...input.projectIds]);
-  for (const reader of closure.overlappingEntries.filter(entry => entry.kind === "reader")) {
+  for (const reader of await liveRootReaders(tx, input.companyId, closure.overlappingEntries)) {
     const { actor } = await retainedRootReader(tx, input.companyId, reader);
     for (const id of workspaceIds) await assertTaskWorkspaceAccess(tx, actor, input.companyId, id);
     await assertRootProjectAccess(tx, actor, input.companyId, projectIds);
@@ -384,7 +417,7 @@ export async function retainIsolatedWorkspaceSourceAccess(db: Db, input: {
       for (const id of target.sourceIds) await assertTaskWorkspaceAccess(tx, input.actor, input.companyId, id);
       await assertRootProjectAccess(tx, input.actor, input.companyId, target.sourceProjectIds,
         { sharedProjectIds: target.sharedProjectIds, issueId: input.issueId });
-      for (const reader of target.overlappingEntries.filter(entry => entry.kind === "reader")) {
+      for (const reader of await liveRootReaders(tx, input.companyId, target.overlappingEntries)) {
         const { actor, issue } = await retainedRootReader(tx, input.companyId, reader);
         await assertRootProjectTrust(tx, { companyId: input.companyId, actor, issueId: issue.id, projectIds: target.sourceProjectIds });
         for (const id of target.sourceIds) await assertTaskWorkspaceAccess(tx, actor, input.companyId, id);
@@ -564,16 +597,8 @@ export function executionWorkspaceRepositoryService(db: Db) {
     companyId: string; cwd: string; sourceWorkspaceId?: string; reader?: RootReader; actor?: AuthorizationActor; issueId?: string; preserveOwnAdmission?: boolean;
   }) {
     const { canonicalCwd, rootKey, entries, overlappingEntries, sourceIds, sharedSourceIds, isolatedSourceIds, sourceProjectIds, sharedProjectIds, isolatedProjectIds } = await resolveRepositoryRootSources(tx, input);
-    // Only readers whose run can still read the root need re-authorization. Readers retained for
-    // finished runs accumulate with every run and multiply the work done under the company-wide
-    // lock (upstream #16381), so they are skipped here and not re-inserted below.
-    const retainedReaders = overlappingEntries.filter(entry => entry.kind === "reader");
-    const liveReaderRunIds = retainedReaders.length ? new Set((await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-      eq(heartbeatRuns.companyId, input.companyId),
-      or(...retainedReaders.map(reader => eq(heartbeatRuns.id, reader.scopeId))),
-      or(eq(heartbeatRuns.status, "queued"), eq(heartbeatRuns.status, "running")),
-    ))).map(run => run.id)) : new Set<string>();
-    const readers = retainedReaders.filter(reader => liveReaderRunIds.has(reader.scopeId) || reader.scopeId === input.reader?.runId);
+    // Finished-run readers are skipped here and not re-inserted below (see liveRootReaders).
+    const readers = await liveRootReaders(tx, input.companyId, overlappingEntries, input.reader?.runId);
     if (input.reader && !entries.some(entry => entry.kind === "reader" && entry.scopeId === input.reader!.runId)) {
       const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.reader.runId), eq(heartbeatRuns.companyId, input.companyId)));
       readers.push({ id: randomUUID(), companyId: input.companyId, rootKey, canonicalCwd, kind: "reader", scopeId: input.reader.runId,
