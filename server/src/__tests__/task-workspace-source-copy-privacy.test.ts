@@ -109,6 +109,38 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(path.join(f.admission.cwd, "source.txt"), "utf8")).toBe("Low-trust source\n");
   });
 
+  it("does not re-authorize readers retained for finished runs under the root lock", async () => {
+    const f = await fixture(), exec = promisify(execFileCallback);
+    await f.service.prepareForAdmission(f.admission);
+    const sourceCwd = path.join(root, `${f.issueId}-finished-reader-source`);
+    await mkdir(sourceCwd);
+    await exec("git", ["init", "--initial-branch=main", sourceCwd]);
+    await writeFile(path.join(sourceCwd, "source.txt"), "Low-trust source\n");
+    await exec("git", ["-C", sourceCwd, "add", "."]);
+    await exec("git", ["-C", sourceCwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "source"]);
+    await rm(f.admission.cwd, { recursive: true });
+    await exec("git", ["-C", sourceCwd, "worktree", "add", "-b", "target", f.admission.cwd]);
+    const projectId = randomUUID();
+    const policy = { ...f.policy, authorizationPolicy: { ...f.policy.authorizationPolicy,
+      trustBoundary: { ...f.policy.authorizationPolicy.trustBoundary, projectIds: [projectId] } } };
+    await db.insert(projects).values({ id: projectId, companyId: f.companyId, name: "Low-trust copied source", executionWorkspacePolicy: policy });
+    await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId, name: "Source", cwd: sourceCwd });
+    await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issueId));
+    // The admitted reader is incompatible with the low-trust source; once its run finishes it can
+    // no longer read the root, so it must neither be re-checked nor block the copy.
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId, responsibleUserId: f.userId,
+      status: "running", contextSnapshot: { issueId: f.issueId, executionPolicy: policy } });
+    const actor = { ...f.actor, runId };
+    const captured = await assertIsolatedWorkspaceSourceReadAccess(db, { companyId: f.companyId, sourceCwd, actor });
+    await expect(retainIsolatedWorkspaceSourceAccess(db, { companyId: f.companyId, sourceCwd, targetCwd: f.admission.cwd,
+      actor, issueId: f.issueId, captured, phase: "verified" })).resolves.toBeUndefined();
+    const entries = await db.select().from(executionWorkspaceRepositoryAccess).where(eq(executionWorkspaceRepositoryAccess.companyId, f.companyId));
+    expect(entries.some(entry => entry.kind === "reader" && entry.scopeId === f.runId)).toBe(true);
+    expect(entries.some(entry => entry.kind === "isolated_copy" && entry.scopeId === projectId)).toBe(true);
+  });
+
   it.each([
     { owner: "configured", direction: "descendant" }, { owner: "configured", direction: "ancestor" },
     { owner: "execution", direction: "descendant" }, { owner: "execution", direction: "ancestor" },
