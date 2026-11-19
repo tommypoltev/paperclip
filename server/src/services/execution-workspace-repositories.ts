@@ -4,7 +4,7 @@ import { isDeepStrictEqual, promisify } from "node:util";
 import fs from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
-import { and, eq, inArray, isNotNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, notExists, or, sql } from "drizzle-orm";
 import { activityLog, agents, heartbeatRuns, projects, projectWorkspaces, executionWorkspaceRepositoryAccess, executionWorkspaceRepositoryRoots, executionWorkspaceRepositories, executionWorkspaces, issues, type Db } from "@paperclipai/db";
 import { prepareWorkspaceRepositorySchema, type PrepareWorkspaceRepository, type ProjectRepository } from "@paperclipai/shared";
 import { withDirectoryPublicationLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -222,6 +222,23 @@ async function liveRootReaders<T extends Pick<typeof executionWorkspaceRepositor
   return retainedReaders.filter(reader => liveRunIds.has(reader.scopeId) || reader.scopeId === currentRunId);
 }
 
+/** Delete reader rows whose run is no longer queued or running. Every root pass loads all
+ * access rows of the company, so finished-run readers cost work even where they are skipped.
+ * Must run under the root lock: readers are only inserted under it, and a pass that re-admits
+ * its own run re-inserts that run's reader. Run status writes are spread over many terminal
+ * paths, so pruning here rather than on run completion also covers reaped and recovered runs. */
+async function pruneFinishedRootReaders(tx: DbTransaction, companyId: string) {
+  await tx.delete(executionWorkspaceRepositoryAccess).where(and(
+    eq(executionWorkspaceRepositoryAccess.companyId, companyId),
+    eq(executionWorkspaceRepositoryAccess.kind, "reader"),
+    notExists(tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, executionWorkspaceRepositoryAccess.scopeId),
+      eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.status, ["queued", "running"]),
+    ))),
+  ));
+}
+
 export async function lockExecutionWorkspaceRootProvenance(tx: DbTransaction, companyId: string) {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`task-repository-roots:${companyId}`}, 0))`);
 }
@@ -240,6 +257,7 @@ async function withRootProvenanceLock<T>(db: Db, companyId: string, cwds: Iterab
     await prime?.().catch(() => undefined);
     return db.transaction(async tx => {
       await lockExecutionWorkspaceRootProvenance(tx, companyId);
+      await pruneFinishedRootReaders(tx, companyId);
       return fn(tx);
     });
   });
